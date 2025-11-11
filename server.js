@@ -204,6 +204,155 @@ async function extractContent(page, database) {
   }, selectors);
 }
 
+// Endpoint dédié pour scraper LinkedIn posts
+app.post('/scrape-linkedin', async (req, res) => {
+  const { profileUrl, email, password, maxPosts = 10 } = req.body;
+
+  if (!profileUrl) {
+    return res.status(400).json({ error: 'profileUrl requis' });
+  }
+
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Identifiants LinkedIn requis (email, password)' });
+  }
+
+  console.log(`[LinkedIn] Scraping profile: ${profileUrl}`);
+
+  let browser;
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    });
+
+    const context = await browser.newContext({
+      viewport: { width: 1920, height: 1080 },
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    });
+
+    const page = await context.newPage();
+
+    // Login LinkedIn
+    console.log('[LinkedIn] Logging in...');
+    await page.goto('https://www.linkedin.com/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(2000);
+
+    // Cookies
+    try {
+      const cookieButton = page.locator('button:has-text("Accepter"), button:has-text("Accept")').first();
+      if (await cookieButton.isVisible({ timeout: 2000 })) {
+        await cookieButton.click();
+        await page.waitForTimeout(500);
+      }
+    } catch (e) {}
+
+    // Credentials
+    const emailSelectors = ['#username', 'input[name="session_key"]', 'input[type="email"]'];
+    const passwordSelectors = ['#password', 'input[name="session_password"]', 'input[type="password"]'];
+
+    for (const selector of emailSelectors) {
+      try {
+        if (await page.locator(selector).isVisible({ timeout: 1000 })) {
+          await page.fill(selector, email);
+          break;
+        }
+      } catch (e) {}
+    }
+
+    await page.waitForTimeout(500);
+
+    for (const selector of passwordSelectors) {
+      try {
+        if (await page.locator(selector).isVisible({ timeout: 1000 })) {
+          await page.fill(selector, password);
+          break;
+        }
+      } catch (e) {}
+    }
+
+    await page.waitForTimeout(500);
+    await page.click('button[type="submit"]');
+    await page.waitForTimeout(15000); // 2FA time
+
+    console.log('[LinkedIn] Login successful!');
+
+    // Naviguer vers les posts
+    await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForTimeout(3000);
+
+    // Scroll
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
+    await page.waitForTimeout(2000);
+
+    // Extraire les posts
+    const posts = await page.evaluate((max) => {
+      const postElements = document.querySelectorAll('[data-urn*="activity"], .feed-shared-update-v2, .occludable-update');
+      const extractedPosts = [];
+
+      postElements.forEach((element, index) => {
+        if (index >= max) return;
+
+        const textElement = element.querySelector('.feed-shared-update-v2__description, .break-words, .feed-shared-text, .update-components-text');
+
+        if (textElement) {
+          let html = textElement.innerHTML || '';
+
+          html = html
+            .replace(/<br\s*\/?>/gi, '\n')
+            .replace(/<\/p>/gi, '\n\n')
+            .replace(/<p[^>]*>/gi, '')
+            .replace(/<div[^>]*>/gi, '')
+            .replace(/<\/div>/gi, '\n')
+            .replace(/<[^>]+>/g, '');
+
+          const tempDiv = document.createElement('div');
+          tempDiv.innerHTML = html;
+          const text = tempDiv.textContent || '';
+
+          const cleanText = text
+            .split('\n')
+            .map(line => line.trim())
+            .filter(line => line.length > 0)
+            .join('\n');
+
+          if (cleanText.length > 50) {
+            extractedPosts.push({
+              subject: `Post ${index + 1}`,
+              content: cleanText
+            });
+          }
+        }
+      });
+
+      return extractedPosts;
+    }, maxPosts);
+
+    await browser.close();
+
+    console.log(`[LinkedIn] ✅ Extracted ${posts.length} posts`);
+
+    if (posts.length === 0) {
+      return res.status(404).json({
+        error: 'Aucun post trouvé. Le profil est peut-être privé ou inaccessible.'
+      });
+    }
+
+    res.json({
+      success: true,
+      posts,
+      count: posts.length
+    });
+
+  } catch (error) {
+    console.error('[LinkedIn] Error:', error);
+    if (browser) await browser.close();
+
+    res.status(500).json({
+      error: error.message || 'Erreur lors du scraping LinkedIn'
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 Supernovia Scraper running on port ${PORT}`);
   console.log(`   Playwright installed: ${process.env.PLAYWRIGHT_BROWSERS_PATH || 'default'}`);
